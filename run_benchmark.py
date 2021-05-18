@@ -14,14 +14,78 @@ import logging
 import sys
 from importlib import util as import_util
 from jsonschema import validate
-
-from pymongo import MongoClient
-import pymongo.errors
+import tempfile
+import datetime
 
 logger = logging.getLogger(__name__)
 sys.excepthook = lambda ex_type, ex, traceback: logger.error(
     f"{ex_type.__name__}: {ex}"
 )
+
+RESULTS_ROOT_DIRECTORY = os.environ.get("PMEMKV_BENCH_RESULTS_DIR", "results")
+
+
+class CmdLine:
+    """Wrapper for list, which may be passed to subprocess. It allows to construct POSIX style commands
+    from parameters passed as the dictionary"""
+    def __init__(self):
+        self.cmdline = []
+
+    def append(self, app, params: dict):
+        params_list = []
+        for key in params:
+            print(f"{key=}")
+            if params[key] == "":
+                params_list.append(key)
+            else:
+                params_list.append(f"{key}={params[key]}")
+        print(f"{params_list=}")
+        self.cmdline.extend([app] + params_list)
+
+    def __str__(self):
+        return " ".join(self)
+
+    def __getitem__(self, item):
+        return self.cmdline[item]
+
+
+class Emon:
+    def __init__(self):
+        self.logger = logging.getLogger(type(self).__name__)
+        self._emon_process = None
+        self._log = tempfile.TemporaryFile()
+
+    def start(self):
+        logger.info("Start emon")
+        cmd = "emon -collect-edp"
+        self._emon_process = subprocess.Popen(cmd, stdout=self._log, shell=True)
+
+    def stop(self, timeout=None):
+        logger.info("Stop emon")
+        subprocess.run("emon -stop", shell=True)
+        self._emon_process.wait(timeout=timeout)
+
+    def get_data(self):
+        if self._emon_process:
+            if self._emon_process.poll() != None:
+                self._log.seek(0)
+                return self._log.read().decode()
+        return None
+
+    def get_emon_v(self):
+        cmd = "emon -v".split()
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            check=True,
+            text=True,
+            universal_newlines=True,
+        ).stdout
+
+    def __del__(self):
+        if self._emon_process != None:
+            if self._emon_process.poll() == None:
+                self.stop(60)
 
 
 class Repository:
@@ -136,7 +200,7 @@ class DB_bench:
             self.logger.error(f"Cannot build benchmark: {e}")
             raise e
 
-    def run(self, environ, benchmark_params):
+    def run(self, environ, benchmark_params, numactl_params=None):
         find_file_path = lambda root_dir, filename: ":".join(
             set(
                 os.path.dirname(x)
@@ -149,15 +213,12 @@ class DB_bench:
         env["PATH"] = self.path + ":" + os.environ["PATH"]
         env["LD_LIBRARY_PATH"] = find_file_path(self.pmemkv.install_path, "*.so.*")
         self.logger.debug(f"{env=}")
-        params_list = [f"{key}={benchmark_params[key]}" for key in benchmark_params]
-
-        numa_settings = []
-        if "NUMACTL_CPUBIND" in env:
-            cpubind = env["NUMACTL_CPUBIND"]
-            numa_settings = ["numactl", f"--cpubind={cpubind}"]
-
-        cmd = numa_settings + ["pmemkv_bench"] + params_list
+        cmd = CmdLine()
+        if numactl_params:
+            cmd.append("numactl", numactl_params)
+        cmd.append("pmemkv_bench", benchmark_params)
         logger.info(cmd)
+
         try:
             self.run_output = subprocess.run(
                 cmd,
@@ -179,24 +240,36 @@ class DB_bench:
         self.logger.info(f"{db_path} cleaned")
 
     def get_results(self):
+        def preprocess(d):
+            return (
+                {k.replace(".", "_"): preprocess(v) for k, v in d.items()}
+                if isinstance(d, dict)
+                else d
+            )
+
         OutputReader = csv.DictReader(
             self.run_output.stdout.decode("UTF-8").split("\n"), delimiter=","
         )
-        return [dict(x) for x in OutputReader]
-
-
-def upload_to_mongodb(address, port, username, password, db_name, collection, data):
-    logger = logging.getLogger("mongodb")
-    client = MongoClient(address, int(port), username=username, password=password)
-    with client:
-        db = client[db_name]
-        collection = db[collection]
-        result = collection.insert_one(data)
-        logger.info(f"Inserted: {result.inserted_id} into {address}:{port}/{db_name}")
+        return [preprocess(x) for x in OutputReader]
 
 
 def print_results(results_dict):
     print(json.dumps(results_dict, indent=4, sort_keys=True))
+
+
+def save_results(results_dict, emon_dat=None):
+    basename = "pmemkv_bench_results"
+    suffix = datetime.datetime.now().strftime("%y%m%d_%H%M%S_%f")
+    dirname = "_".join([basename, suffix])
+    results_path = os.path.join(RESULTS_ROOT_DIRECTORY, dirname)
+    os.makedirs(results_path)
+    output_file = os.path.join(results_path, "result.json")
+    with open(output_file, "w") as outfile:
+        json.dump(results_dict, outfile, indent=4, sort_keys=True)
+
+    if emon_dat:
+        with open(os.path.join(results_path, "emon.dat"), "w") as emon_file:
+            emon_file.write(emon_dat)
 
 
 def load_scenarios(path, schema_path=None):
@@ -248,25 +321,10 @@ Runs pmemkv-bench for pmemkv and libpmemobjcpp defined in configuration json
 | +------------------------+          |       | pmemkv-bench          |
 | | pmemkv bench           |          |       | git repository        |
 | | +----------------------+ <----------------+                       |
-| | Runs benchmark and     |          |       |                       |
-| | uploads results to     |          |       +-----------------------+
-| | mongoDB                |          |
-| |                        |          |       --------------------------+
-| |                        +----------------->+ MongoDB instance        |
-| +------------------------+          |       | +-----------------------+
-|                                     |       | Collects benchmarks     |
-|                                     |       | results                 |
-|                                     |       +----------+--------------+
-+-------------------------------------+                  |
-                                                         v
-                                              +----------+--------------+
-                                              |  MongoDB Charts         |
-                                              |  +----------------------+
-                                              |  Displays collected data|
-                                              +-------------------------+
-
-Environment variables for MongoDB client configuration:
-  MONGO_ADDRESS, MONGO_PORT, MONGO_USER, MONGO_PASSWORD, MONGO_DB_NAME and MONGO_DB_COLLECTION
+| | Runs benchmark         |          |       |                       |
+| |                        |          |       +-----------------------+
+| +------------------------+          | 
++-------------------------------------+ 
 """
     # Setup loglevel
     LOGLEVEL = os.environ.get("LOGLEVEL") or "INFO"
@@ -289,19 +347,6 @@ This parameter sets configuration of benchmarking process. Input structure is sp
     args = parser.parse_args()
     logger.info(f"{args.build_config_path=}")
 
-    # Setup database
-    db_address = db_port = db_user = db_passwd = db_name = db_collection = None
-    try:
-        db_address = os.environ["MONGO_ADDRESS"]
-        db_port = os.environ["MONGO_PORT"]
-        db_user = os.environ["MONGO_USER"]
-        db_passwd = os.environ["MONGO_PASSWORD"]
-        db_name = os.environ["MONGO_DB_NAME"]
-        db_collection = os.environ["MONGO_DB_COLLECTION"]
-    except KeyError as e:
-        logger.warning(
-            f"Environment variable {e} was not specified, so results cannot be uploaded to the database"
-        )
     schema_dir = os.path.join(
         os.path.dirname(os.path.realpath(__file__)), "bench_scenarios"
     )
@@ -326,30 +371,29 @@ This parameter sets configuration of benchmarking process. Input structure is sp
 
     benchmark.build()
     for test_case in bench_params:
+        emon = Emon()
         logger.info(f"Running: {test_case}")
-        benchmark.run(test_case["env"], test_case["params"])
-        benchmark.cleanup(test_case["params"])
+        if test_case.get("emon") == "True":
+            emon.start()
+        benchmark.run(
+            test_case["env"], test_case["pmemkv_bench"], test_case.get("numactl")
+        )
+        if test_case.get("emon") == "True":
+            emon.stop()
+        benchmark.cleanup(test_case["pmemkv_bench"])
         benchmark_results = benchmark.get_results()
 
         report = {}
         report["build_configuration"] = config
         report["runtime_parameters"] = test_case
         report["results"] = benchmark_results
-
         print_results(report)
-        if (
-            db_address
-            and db_port
-            and db_user
-            and db_passwd
-            and db_name
-            and db_collection
-        ):
-            upload_to_mongodb(
-                db_address, db_port, db_user, db_passwd, db_name, db_collection, report
-            )
-        else:
-            logger.warning("Results not uploaded to database")
+
+        emon_data = None
+        if test_case.get("emon") == "True":
+            emon_data = emon.get_data()
+
+        save_results(report, emon_data)
 
 
 if __name__ == "__main__":
